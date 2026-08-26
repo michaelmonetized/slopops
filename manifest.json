@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "michael.ops",
+  "name": "Ops",
+  "version": "0.1.0",
+  "author": "michael",
+  "description": "Multi-service ops panel: tailnet fleet, Vercel deploys, Sentry errors, PostHog traffic, GitHub issues",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Ops.qml"
+  },
+  "barWidget": {
+    "displayName": "Ops panel",
+    "description": "Fleet / deployments / sentry / traffic / issues in one tabbed popup",
+    "category": "Monitoring",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 90,
+      "fleetPorts": "22,5900",
+      "t3Port": 3773,
+      "vercelTeamId": "",
+      "sentryOrg": "",
+      "sentryUrl": "https://sentry.io",
+      "posthogUrl": "https://us.posthog.com",
+      "issueRepo": "",
+      "ghOwner": ""
+    },
+    "schema": [
+      {
+        "key": "refreshSeconds",
+        "type": "number",
+        "label": "Refresh interval (seconds)"
+      },
+      {
+        "key": "fleetPorts",
+        "type": "string",
+        "label": "Fleet probe ports (comma separated)"
+      },
+      {
+        "key": "t3Port",
+        "type": "number",
+        "label": "t3 serve port (0 disables the t3 light)"
+      },
+      {
+        "key": "vercelTeamId",
+        "type": "string",
+        "label": "Vercel team id (optional)"
+      },
+      {
+        "key": "sentryOrg",
+        "type": "string",
+        "label": "Sentry org slug"
+      },
+      {
+        "key": "sentryUrl",
+        "type": "string",
+        "label": "Sentry base URL"
+      },
+      {
+        "key": "posthogUrl",
+        "type": "string",
+        "label": "PostHog base URL"
+      },
+      {
+        "key": "issueRepo",
+        "type": "string",
+        "label": "Target repo for promoted Sentry issues (owner/repo)"
+      },
+      {
+        "key": "ghOwner",
+        "type": "string",
+        "label": "GitHub owner (blank = authenticated user)"
+      }
+    ]
+  }
+}
