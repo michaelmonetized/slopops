@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "michael.ops",
-  "name": "Ops",
+  "id": "slopops",
+  "name": "SlopOps",
   "version": "0.1.0",
   "author": "michael",
   "description": "Multi-service ops panel: tailnet fleet, Vercel deploys, Sentry errors, PostHog traffic, GitHub issues",

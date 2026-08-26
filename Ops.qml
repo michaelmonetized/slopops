@@ -7,8 +7,8 @@ import qs.Ui
 Panel {
   id: root
 
-  moduleName: "michael.ops"
-  ipcTarget: "michael.ops"
+  moduleName: "slopops"
+  ipcTarget: "slopops"
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight

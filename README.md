@@ -1,4 +1,4 @@
-# michael.ops
+# slopops
 
 Tabbed ops panel for the Omarchy bar: one icon, five tabs.
 
@@ -26,15 +26,15 @@ GitHub uses your existing `gh` CLI login — run `gh auth login` once if needed.
 Everything is a widget setting so one build fits many machines:
 
 ```bash
-omarchy bar set michael.ops fleetPorts "22,5900" --json
-omarchy bar set michael.ops t3Port 3773          # 0 hides the t3 light
-omarchy bar set michael.ops sentryOrg acme
-omarchy bar set michael.ops sentryUrl https://sentry.selfhosted.example   # self-hosted
-omarchy bar set michael.ops posthogUrl https://eu.posthog.com
-omarchy bar set michael.ops vercelTeamId team_xxx
-omarchy bar set michael.ops issueRepo me/infra   # where promoted Sentry issues land
-omarchy bar set michael.ops issuesScope "author:@me state:open"
-omarchy bar set michael.ops refreshSeconds 120
+omarchy bar set slopops fleetPorts "22,5900" --json
+omarchy bar set slopops t3Port 3773          # 0 hides the t3 light
+omarchy bar set slopops sentryOrg acme
+omarchy bar set slopops sentryUrl https://sentry.selfhosted.example   # self-hosted
+omarchy bar set slopops posthogUrl https://eu.posthog.com
+omarchy bar set slopops vercelTeamId team_xxx
+omarchy bar set slopops issueRepo me/infra   # where promoted Sentry issues land
+omarchy bar set slopops issuesScope "author:@me state:open"
+omarchy bar set slopops refreshSeconds 120
 ```
 
 `t3Port` probes each peer's t3 Code server over its tailnet IP (the light is green
