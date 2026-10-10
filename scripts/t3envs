@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""t3envs: your T3 Code environments across the tailnet, live, plus a quick shell.
+
+  t3envs list [--json] [--ports 22,5900] [--no-mint] [--no-t3]
+  t3envs shell NAME [PROJECT]     ssh in (cd to a T3 project's workspace when given)
+  t3envs open NAME [PROJECT]      same, in a new terminal window (used by the bar)
+
+Machines come from `tailscale status --json`. Each online machine is asked,
+over `ssh -o BatchMode=yes` (or locally for this machine), for its T3 Code
+status through that machine's own T3 MCP server: streamable HTTP at
+<origin>/mcp (origin from ~/.t3/userdata/server-runtime.json), tools
+t3_environment_read, t3_project_list and t3_thread_list, with a read-only
+`orchestration:read` MCP client credential. T3 binds loopback, so the MCP
+call runs on the machine itself; nothing new is exposed on the network.
+
+The credential lives on each machine in ~/.config/slopops/t3-mcp-token (0600).
+When missing or rejected it is minted once with
+  t3 auth session issue --scope orchestration:read --subject mcp-client --ttl 90d --token-only
+unless --no-mint is given (then the row says "needs credential").
+"""
+
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+ACTIVE = ["preparing", "queued", "starting", "running", "waiting"]
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=2"]
+SKIP_OS = {"iOS", "android", "tvOS"}
+
+# Runs ON the target machine (python3 -, stdin). Standard library only.
+PROBE = r'''
+import json, os, shutil, subprocess, sys, urllib.request, urllib.error
+mint = sys.argv[1:2] == ["1"]
+home = os.environ.get("T3CODE_HOME") or os.path.expanduser("~/.t3")
+out = {"t3": "absent"}
+def done():
+    print(json.dumps(out)); sys.exit(0)
+t3 = None
+for c in (shutil.which("t3"), os.path.expanduser("~/.local/bin/t3"), os.path.join(home, "bin", "t3"),
+          "/opt/homebrew/bin/t3", "/usr/local/bin/t3"):
+    if c and os.access(c, os.X_OK):
+        t3 = c; break
+try:
+    with open(os.path.join(home, "userdata", "server-runtime.json")) as f:
+        origin = (json.load(f).get("origin") or "").rstrip("/")
+except (OSError, ValueError):
+    origin = ""
+if not origin:
+    out["t3"] = "down" if t3 else "absent"
+    out["error"] = "no running T3 server" if t3 else "T3 Code not installed"
+    done()
+out["origin"] = origin
+tokdir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "slopops")
+tokfile = os.path.join(tokdir, "t3-mcp-token")
+def read_token():
+    try:
+        with open(tokfile) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+def mint_token():
+    if not (mint and t3):
+        return None
+    try:
+        r = subprocess.run([t3, "auth", "session", "issue", "--scope", "orchestration:read",
+                            "--subject", "mcp-client", "--label", "slopops fleet", "--ttl", "90d",
+                            "--token-only"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        return None
+    os.makedirs(tokdir, mode=0o700, exist_ok=True)
+    fd = os.open(tokfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(lines[-1] + "\n")
+    return lines[-1]
+class Unauthorized(Exception):
+    pass
+class Mcp:
+    def __init__(self, token):
+        self.token, self.sid, self.n = token, None, 0
+    def post(self, body):
+        h = {"authorization": "Bearer " + self.token, "content-type": "application/json",
+             "accept": "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18"}
+        if self.sid:
+            h["mcp-session-id"] = self.sid
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(origin + "/mcp", json.dumps(body).encode(), h), timeout=8)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise Unauthorized()
+            raise
+        with r:
+            self.sid = r.headers.get("mcp-session-id") or self.sid
+            raw = r.read().decode("utf-8", "replace")
+            if not raw.strip():
+                return None
+            if r.headers.get("content-type", "").startswith("text/event-stream"):
+                for line in raw.splitlines():
+                    if line.startswith("data:"):
+                        m = json.loads(line[5:])
+                        if "id" in m:
+                            return m
+                return None
+            return json.loads(raw)
+    def rpc(self, method, params):
+        self.n += 1
+        m = self.post({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        if not m or "error" in m:
+            raise RuntimeError("%s: %s" % (method, (m or {}).get("error")))
+        return m["result"]
+    def call(self, name, args):
+        res = self.rpc("tools/call", {"name": name, "arguments": args})
+        if res.get("isError"):
+            raise RuntimeError("".join(c.get("text", "") for c in res.get("content", []))[:200])
+        return res.get("structuredContent") or json.loads(res["content"][0]["text"])
+def probe(token):
+    mcp = Mcp(token)
+    mcp.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "slopops-t3envs", "version": "0.2.0"}})
+    mcp.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    env = mcp.call("t3_environment_read", {})
+    out.update({"label": env.get("label"), "version": env.get("serverVersion"),
+                "environmentId": env.get("environmentId"), "platform": env.get("platform")})
+    projects, cursor = [], None
+    while True:
+        a = {"limit": 100}
+        if cursor is not None:
+            a["cursor"] = cursor
+        page = mcp.call("t3_project_list", a)
+        projects += [p for p in page.get("projects", []) if not p.get("deletedAt")]
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            break
+    active, rows = 0, []
+    for p in projects:
+        n = mcp.call("t3_thread_list", {"projectId": p["id"], "statuses": ACTIVE, "settled": False, "limit": 1}).get("total", 0)
+        active += n
+        rows.append({"id": p["id"], "title": p.get("title") or "", "root": p.get("workspaceRoot") or "", "active": n})
+    rows.sort(key=lambda r: (-r["active"], r["title"].lower()))
+    out.update({"t3": "ok", "projects": rows[:30], "projectCount": len(projects), "active": active})
+ACTIVE = __ACTIVE__
+token = read_token() or mint_token()
+if not token:
+    out["t3"] = "auth"; out["error"] = "needs credential (run: t3envs list on this machine, or allow minting)"
+    done()
+try:
+    try:
+        probe(token)
+    except Unauthorized:
+        token = mint_token()
+        if not token:
+            out["t3"] = "auth"; out["error"] = "T3 rejected the credential"
+            done()
+        probe(token)
+except Unauthorized:
+    out["t3"] = "auth"; out["error"] = "T3 rejected the credential"
+except Exception as e:
+    out["t3"] = "down"; out["error"] = (str(e) or e.__class__.__name__)[:200]
+done()
+'''.replace("__ACTIVE__", json.dumps(ACTIVE))
+
+
+# Same probe for machines without a working python3 (stock macOS ships only the
+# Xcode stub). Runs as `node -` on the target; Node 18+ for fetch.
+PROBE_JS = r'''
+const fs = require("fs"), os = require("os"), path = require("path"), cp = require("child_process");
+const mint = process.argv[2] === "1";
+const home = process.env.T3CODE_HOME || path.join(os.homedir(), ".t3");
+const out = { t3: "absent" };
+const done = () => { console.log(JSON.stringify(out)); process.exit(0); };
+const ACTIVE = __ACTIVE__;
+const exe = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; } };
+const t3 = [...(process.env.PATH || "").split(":").map((d) => path.join(d, "t3")),
+  path.join(os.homedir(), ".local/bin/t3"), path.join(home, "bin/t3"), "/opt/homebrew/bin/t3", "/usr/local/bin/t3"].find(exe);
+let origin = "";
+try { origin = (JSON.parse(fs.readFileSync(path.join(home, "userdata/server-runtime.json"), "utf8")).origin || "").replace(/\/$/, ""); } catch {}
+const tokdir = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "slopops");
+const tokfile = path.join(tokdir, "t3-mcp-token");
+const readToken = () => { try { return fs.readFileSync(tokfile, "utf8").trim() || null; } catch { return null; } };
+const mintToken = () => {
+  if (!(mint && t3)) return null;
+  const r = cp.spawnSync(t3, ["auth", "session", "issue", "--scope", "orchestration:read", "--subject", "mcp-client",
+    "--label", "slopops fleet", "--ttl", "90d", "--token-only"], { encoding: "utf8", timeout: 60000 });
+  const lines = (r.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (r.status !== 0 || !lines.length) return null;
+  fs.mkdirSync(tokdir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(tokfile, lines[lines.length - 1] + "\n", { mode: 0o600 });
+  return lines[lines.length - 1];
+};
+class Unauthorized extends Error {}
+async function probe(token) {
+  let sid = null, n = 0;
+  const post = async (body) => {
+    const h = { authorization: "Bearer " + token, "content-type": "application/json",
+      accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" };
+    if (sid) h["mcp-session-id"] = sid;
+    const r = await fetch(origin + "/mcp", { method: "POST", headers: h, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) });
+    if (r.status === 401) throw new Unauthorized();
+    if (!r.ok && r.status !== 202) throw new Error("HTTP " + r.status);
+    sid = r.headers.get("mcp-session-id") || sid;
+    const raw = await r.text();
+    if (!raw.trim()) return null;
+    if ((r.headers.get("content-type") || "").startsWith("text/event-stream")) {
+      for (const line of raw.split("\n")) if (line.startsWith("data:")) { const m = JSON.parse(line.slice(5)); if ("id" in m) return m; }
+      return null;
+    }
+    return JSON.parse(raw);
+  };
+  const rpc = async (method, params) => {
+    const m = await post({ jsonrpc: "2.0", id: ++n, method, params });
+    if (!m || m.error) throw new Error(method + ": " + JSON.stringify(m && m.error));
+    return m.result;
+  };
+  const call = async (name, args) => {
+    const res = await rpc("tools/call", { name, arguments: args });
+    if (res.isError) throw new Error((res.content || []).map((c) => c.text || "").join("").slice(0, 200));
+    return res.structuredContent || JSON.parse(res.content[0].text);
+  };
+  await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "slopops-t3envs", version: "0.2.0" } });
+  await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const env = await call("t3_environment_read", {});
+  Object.assign(out, { label: env.label, version: env.serverVersion, environmentId: env.environmentId, platform: env.platform });
+  let projects = [], cursor = null;
+  for (;;) {
+    const a = { limit: 100 };
+    if (cursor !== null && cursor !== undefined) a.cursor = cursor;
+    const page = await call("t3_project_list", a);
+    projects = projects.concat((page.projects || []).filter((p) => !p.deletedAt));
+    cursor = page.nextCursor;
+    if (cursor === null || cursor === undefined) break;
+  }
+  let active = 0; const rows = [];
+  for (const p of projects) {
+    const t = await call("t3_thread_list", { projectId: p.id, statuses: ACTIVE, settled: false, limit: 1 });
+    const k = t.total || 0; active += k;
+    rows.push({ id: p.id, title: p.title || "", root: p.workspaceRoot || "", active: k });
+  }
+  rows.sort((a, b) => b.active - a.active || a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
+  Object.assign(out, { t3: "ok", projects: rows.slice(0, 30), projectCount: projects.length, active });
+}
+(async () => {
+  if (!origin) { out.t3 = t3 ? "down" : "absent"; out.error = t3 ? "no running T3 server" : "T3 Code not installed"; done(); }
+  out.origin = origin;
+  let token = readToken() || mintToken();
+  if (!token) { out.t3 = "auth"; out.error = "needs credential (run: t3envs list on this machine, or allow minting)"; done(); }
+  try {
+    try { await probe(token); }
+    catch (e) {
+      if (!(e instanceof Unauthorized)) throw e;
+      token = mintToken();
+      if (!token) { out.t3 = "auth"; out.error = "T3 rejected the credential"; done(); }
+      await probe(token);
+    }
+  } catch (e) {
+    if (e instanceof Unauthorized) { out.t3 = "auth"; out.error = "T3 rejected the credential"; }
+    else { out.t3 = "down"; out.error = String((e && e.message) || e).slice(0, 200); }
+  }
+  done();
+})();
+'''.replace("__ACTIVE__", json.dumps(ACTIVE))
+
+# Pick an interpreter on the target. Exit 97 = no usable python3 (try node), 98 = neither.
+PY_LAUNCH = 'python3 -c 1 >/dev/null 2>&1 || exit 97; exec python3 - %s'
+JS_LAUNCH = ('for n in node /opt/homebrew/bin/node /usr/local/bin/node; do '
+             'if command -v "$n" >/dev/null 2>&1; then exec "$n" - %s; fi; done; exit 98')
+
+
+def local_python():
+    exe = sys.executable or ""
+    if os.path.basename(exe).startswith("python"):
+        return exe
+    return shutil.which("python3") or "/usr/bin/python3"
+
+
+def tailnet():
+    tailscale = shutil.which("tailscale")
+    if not tailscale:
+        return None, "tailscale not on PATH"
+    try:
+        raw = subprocess.run([tailscale, "status", "--json"], capture_output=True, text=True, timeout=10)
+        data = json.loads(raw.stdout or "{}")
+    except Exception as e:
+        return None, "tailscale status failed: %s" % e
+    self_node = data.get("Self") or {}
+    nodes, seen = [], set()
+    for d in [self_node] + list((data.get("Peer") or {}).values()):
+        nid = d.get("ID", "")
+        if not d or nid in seen or d.get("OS") in SKIP_OS:
+            continue
+        seen.add(nid)
+        ips = d.get("TailscaleIPs") or []
+        nodes.append({
+            "name": d.get("HostName") or (d.get("DNSName") or "?").split(".")[0],
+            "dns": (d.get("DNSName") or "").rstrip("."),
+            "ip": ips[0] if ips else "",
+            "os": d.get("OS") or "",
+            "online": bool(d.get("Online")) or nid == self_node.get("ID"),
+            "self": nid == self_node.get("ID"),
+        })
+    return nodes, None
+
+
+def port_open(ip, port):
+    try:
+        socket.create_connection((ip, port), timeout=1.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def ssh_targets(node):
+    """Name first (matches ~/.ssh/config Host entries), then the tailnet IP.
+
+    A Host entry pinned to a stale LAN address is common; the tailnet IP still
+    works when that happens.
+    """
+    out = []
+    for t in (node["name"], node["ip"]):
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def reachable_target(node):
+    for target in ssh_targets(node):
+        try:
+            r = subprocess.run(["ssh", *SSH_OPTS, target, "true"], capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+        if r.returncode == 0:
+            return target
+    return ssh_targets(node)[0]
+
+
+def run_probe(node, mint):
+    args = ["1" if mint else "0"]
+    if node["self"]:
+        attempts = [(None, [local_python(), "-", *args])]
+    else:
+        attempts = [(t, ["ssh", *SSH_OPTS, t, PY_LAUNCH % args[0]]) for t in ssh_targets(node)]
+    r, target, msg = None, None, "ssh failed"
+    for target, cmd in attempts:
+        try:
+            r = subprocess.run(cmd, input=PROBE, capture_output=True, text=True, timeout=25)
+            if r.returncode == 97 and target is not None:
+                cmd = ["ssh", *SSH_OPTS, target, JS_LAUNCH % args[0]]
+                r = subprocess.run(cmd, input=PROBE_JS, capture_output=True, text=True, timeout=25)
+                if r.returncode == 98:
+                    return {"ssh": True, "sshTarget": target, "t3": "down",
+                            "error": "neither python3 nor node works on this machine"}
+        except subprocess.TimeoutExpired:
+            r, msg = None, "probe timed out"
+            continue
+        if r.returncode == 255 and target is not None:
+            msg = (r.stderr.strip().splitlines() or ["ssh failed"])[-1]
+            r = None
+            continue
+        break
+    if r is None:
+        return {"ssh": False, "t3": "unreachable", "error": msg[:200]}
+    lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
+    if not lines:
+        err = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        if "python3" in err and ("not found" in err or "No such file" in err):
+            err = "python3 not available on this machine"
+        return {"ssh": True, "t3": "down", "error": err[:200]}
+    res = json.loads(lines[-1])
+    res["ssh"] = True
+    if target is not None:
+        res["sshTarget"] = target
+    return res
+
+
+def collect(ports, mint, t3=True):
+    nodes, err = tailnet()
+    if nodes is None:
+        return {"error": err, "envs": []}
+
+    def one(node):
+        row = dict(node, services={str(p): False for p in ports}, t3="na", ssh=False)
+        if not node["online"]:
+            return row
+        if node["ip"]:
+            for p in ports:
+                row["services"][str(p)] = port_open(node["ip"], p)
+        if t3:
+            row.update(run_probe(node, mint))
+        return row
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        envs = list(ex.map(one, nodes))
+    envs.sort(key=lambda r: (not r["self"], not r["online"], r["name"].lower()))
+    return {"envs": envs, "peers": envs}  # "peers" kept for older tab code
+
+
+def status_word(e):
+    if not e["online"]:
+        return "offline"
+    return {"ok": "t3 ok", "auth": "t3 needs credential", "down": "t3 down", "absent": "no t3",
+            "unreachable": "ssh unreachable", "na": "-"}.get(e.get("t3"), e.get("t3", "?"))
+
+
+def print_table(data):
+    if data.get("error"):
+        print("t3envs: " + data["error"], file=sys.stderr)
+    for e in data["envs"]:
+        name = e["name"] + (" *" if e["self"] else "")
+        bits = [status_word(e)]
+        if e.get("t3") == "ok":
+            bits.append("%d running" % e.get("active", 0))
+            bits.append("%d projects" % e.get("projectCount", 0))
+            if e.get("version"):
+                bits.append(e["version"])
+        elif e.get("error") and e["online"]:
+            bits.append(e["error"])
+        print("%-18s %-16s %s" % (name, e["ip"], " · ".join(bits)))
+
+
+def find_env(name, data):
+    for e in data["envs"]:
+        if name in (e["name"], e["dns"], e["ip"], e["dns"].split(".")[0]):
+            return e
+    return None
+
+
+def shell_command(env, project=None, envs_data=None):
+    """argv for an interactive shell on env, optionally inside a project root."""
+    root = None
+    if project:
+        for p in env.get("projects") or []:
+            if project in (p["id"], p["title"], os.path.basename(p["root"])):
+                root = p["root"]
+                break
+        if root is None:
+            raise SystemExit("t3envs: no project %r on %s (see t3envs list)" % (project, env["name"]))
+    if env["self"]:
+        if root:
+            os.chdir(root)
+        return [os.environ.get("SHELL") or "/bin/sh", "-l"]
+    cmd = ["ssh", "-t", env.get("sshTarget") or reachable_target(env)]
+    if root:
+        cmd.append("cd %s && exec \"${SHELL:-/bin/sh}\" -l" % shlex.quote(root))
+    return cmd
+
+
+def terminal_argv(argv):
+    for launcher in ("xdg-terminal-exec",):
+        if shutil.which(launcher):
+            return [launcher, *argv]
+    term = os.environ.get("TERMINAL")
+    if term and shutil.which(term):
+        return [term, "-e", *argv]
+    for term in ("ghostty", "alacritty", "kitty", "foot"):
+        if shutil.which(term):
+            return [term, "-e", *argv]
+    raise SystemExit("t3envs: no terminal found (install xdg-terminal-exec or set $TERMINAL)")
+
+
+def main(argv):
+    cmd = argv[0] if argv else "list"
+    rest = argv[1:]
+    ports, mint, as_json, t3 = [], True, False, True
+    positional = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--no-mint":
+            mint = False
+        elif a == "--no-t3":
+            t3 = False
+        elif a == "--ports" and i + 1 < len(rest):
+            ports = [int(p) for p in rest[i + 1].split(",") if p.strip().isdigit()]
+            i += 1
+        else:
+            positional.append(a)
+        i += 1
+    if os.environ.get("T3ENVS_NO_MINT") == "1":
+        mint = False
+
+    if cmd == "list":
+        data = collect(ports, mint, t3)
+        if as_json:
+            print(json.dumps(data))
+        else:
+            print_table(data)
+        return 0
+    if cmd in ("shell", "open"):
+        if not positional:
+            raise SystemExit("usage: t3envs %s NAME [PROJECT]" % cmd)
+        name, project = positional[0], (positional[1] if len(positional) > 1 else None)
+        if project:
+            data = collect([], mint)
+            env = find_env(name, data)
+        else:
+            nodes, err = tailnet()
+            env = find_env(name, {"envs": nodes or []})
+            if env is None and nodes is None:
+                raise SystemExit("t3envs: " + err)
+        if env is None:
+            raise SystemExit("t3envs: no machine named %r on the tailnet" % name)
+        argv2 = shell_command(env, project)
+        if cmd == "open":
+            subprocess.Popen(terminal_argv(argv2), start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 0
+        os.execvp(argv2[0], argv2)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
